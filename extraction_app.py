@@ -1,0 +1,442 @@
+"""
+extraction_app.py — Rayyan-like AI extraction & verification tool (local).
+
+Workflow:
+- Upload one PDF or a batch (queue). The AI extracts in the background, results
+  become "drafts" you review one by one.
+- For each draft: side-by-side form (with source quotes + extracted text) ->
+  correct -> save as verified.
+- Export verified studies to a relational Excel (4 sheets matching your DB).
+"""
+
+import os
+import json
+import sqlite3
+import datetime as dt
+import base64
+from pathlib import Path
+
+import streamlit as st
+import pandas as pd
+
+import extractor
+
+DB = Path(__file__).parent / "extractions.db"
+PDF_CACHE = Path(__file__).parent / "_pdf_cache"
+PDF_CACHE.mkdir(exist_ok=True)
+st.set_page_config(page_title="AISESA — AI Extraction", layout="wide", page_icon="📄")
+
+
+# ── Storage ──────────────────────────────────────────────────────────────────────
+def init_db():
+    con = sqlite3.connect(DB)
+    con.execute("""CREATE TABLE IF NOT EXISTS extractions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_file TEXT, model TEXT,
+        status TEXT DEFAULT 'verified',          -- 'draft' or 'verified'
+        created_at TEXT, verified_at TEXT,
+        data_json TEXT, quotes_json TEXT,
+        text_extracted TEXT, pdf_path TEXT,
+        error TEXT)""")
+    # Add columns if upgrading from the older schema
+    cols = [r[1] for r in con.execute("PRAGMA table_info(extractions)").fetchall()]
+    for col, typ in [("status", "TEXT DEFAULT 'verified'"), ("created_at", "TEXT"),
+                     ("text_extracted", "TEXT"), ("pdf_path", "TEXT"), ("error", "TEXT")]:
+        if col not in cols:
+            con.execute(f"ALTER TABLE extractions ADD COLUMN {col} {typ}")
+    con.commit()
+    con.close()
+
+
+def save_draft(source_file, model, result, text, pdf_path, error=None):
+    """Save an unverified extraction (or a failed one) as a draft."""
+    values = {f: result[f]["value"] for f in extractor.EXPORT_FIELDS if f in result} if result else {}
+    quotes = {f: result[f]["quote"] for f in extractor.EXPORT_FIELDS if f in result} if result else {}
+    con = sqlite3.connect(DB)
+    con.execute(
+        "INSERT INTO extractions (source_file, model, status, created_at, data_json, quotes_json, "
+        "text_extracted, pdf_path, error) VALUES (?,?,?,?,?,?,?,?,?)",
+        (source_file, model, "draft" if not error else "failed",
+         dt.datetime.now().isoformat(timespec="seconds"),
+         json.dumps(values, ensure_ascii=False),
+         json.dumps(quotes, ensure_ascii=False),
+         text, str(pdf_path) if pdf_path else "", error))
+    con.commit()
+    con.close()
+
+
+def update_verified(row_id, values, quotes):
+    con = sqlite3.connect(DB)
+    con.execute("UPDATE extractions SET status='verified', verified_at=?, data_json=?, "
+                "quotes_json=? WHERE id=?",
+                (dt.datetime.now().isoformat(timespec="seconds"),
+                 json.dumps(values, ensure_ascii=False),
+                 json.dumps(quotes, ensure_ascii=False), row_id))
+    con.commit()
+    con.close()
+
+
+def load_drafts() -> pd.DataFrame:
+    con = sqlite3.connect(DB)
+    df = pd.read_sql("SELECT id, source_file, status, created_at, error FROM extractions "
+                     "WHERE status IN ('draft','failed') ORDER BY id", con)
+    con.close()
+    return df
+
+
+def load_one(row_id):
+    con = sqlite3.connect(DB)
+    row = con.execute("SELECT source_file, data_json, quotes_json, text_extracted, pdf_path "
+                      "FROM extractions WHERE id=?", (row_id,)).fetchone()
+    con.close()
+    if not row:
+        return None
+    values = json.loads(row[1] or "{}")
+    quotes = json.loads(row[2] or "{}")
+    # Rehydrate the {value,quote} structure the verification UI expects
+    result = {f: {"value": values.get(f, ""), "quote": quotes.get(f, "")}
+              for f in extractor.SCHEMA_FIELDS + ["power_pool"]}
+    return {"source_file": row[0], "result": result, "text": row[3] or "", "pdf_path": row[4] or ""}
+
+
+def load_verified() -> pd.DataFrame:
+    con = sqlite3.connect(DB)
+    rows = con.execute("SELECT id, source_file, verified_at, data_json FROM extractions "
+                       "WHERE status='verified' ORDER BY id").fetchall()
+    con.close()
+    records = []
+    for _id, src, ts, dj in rows:
+        rec = {"_id": _id, "source_file": src, "verified_at": ts}
+        rec.update(json.loads(dj or "{}"))
+        records.append(rec)
+    return pd.DataFrame(records)
+
+
+def counts():
+    con = sqlite3.connect(DB)
+    c = {r[0]: r[1] for r in con.execute("SELECT COALESCE(status,'verified'), COUNT(*) "
+                                          "FROM extractions GROUP BY status").fetchall()}
+    con.close()
+    return c
+
+
+def delete_extraction(row_id):
+    con = sqlite3.connect(DB)
+    pdf = con.execute("SELECT pdf_path FROM extractions WHERE id=?", (row_id,)).fetchone()
+    if pdf and pdf[0] and Path(pdf[0]).exists():
+        try: Path(pdf[0]).unlink()
+        except OSError: pass
+    con.execute("DELETE FROM extractions WHERE id=?", (row_id,))
+    con.commit(); con.close()
+
+
+def reset_all():
+    con = sqlite3.connect(DB)
+    con.execute("DELETE FROM extractions")
+    con.execute("DELETE FROM sqlite_sequence WHERE name='extractions'")
+    con.commit(); con.close()
+    for p in PDF_CACHE.glob("*.pdf"):
+        try: p.unlink()
+        except OSError: pass
+
+
+def build_relational_excel(df: pd.DataFrame, out_path):
+    import re as _re
+    def split(v): return [x.strip() for x in _re.split(r"[,;]", str(v)) if x.strip()]
+    studies, tools, ctries, pools = [], [], [], []
+    for _, r in df.iterrows():
+        sid = r["_id"]
+        srow = {"study_id": sid, "source_file": r.get("source_file", "")}
+        for f in extractor.EXPORT_FIELDS:
+            if f not in ("tools_used", "tool_categories"):
+                srow[f] = r.get(f, "")
+        studies.append(srow)
+        for i, t in enumerate(split(r.get("tools_used", ""))):
+            cats = split(r.get("tool_categories", ""))
+            tools.append({"study_id": sid, "tool_name": t,
+                          "tool_category": cats[i] if i < len(cats) else ""})
+        for iso in split(r.get("countries", "")):
+            ctries.append({"study_id": sid, "iso_code": iso})
+        for p in split(r.get("power_pool", "")):
+            pools.append({"study_id": sid, "pool_code": p})
+    with pd.ExcelWriter(out_path, engine="openpyxl") as xl:
+        pd.DataFrame(studies).to_excel(xl, sheet_name="studies", index=False)
+        pd.DataFrame(tools).to_excel(xl, sheet_name="study_tools", index=False)
+        pd.DataFrame(ctries).to_excel(xl, sheet_name="study_countries", index=False)
+        pd.DataFrame(pools).to_excel(xl, sheet_name="study_pools", index=False)
+
+
+def run_extraction(pdf_path, api_key, model, upgrade_synth):
+    """Run extraction and save as draft. Returns (success, error_msg)."""
+    source = Path(pdf_path).name
+    cached_pdf = PDF_CACHE / f"{dt.datetime.now().strftime('%Y%m%d%H%M%S%f')}_{source}"
+    try:
+        # Copy PDF to cache so we can show it later in the review screen
+        cached_pdf.write_bytes(Path(pdf_path).read_bytes())
+        text = extractor.extract_text(pdf_path)
+        if len(text) < 500:
+            raise ValueError("Extracted text too short — PDF may be scanned (needs OCR).")
+        result = extractor.extract_pdf(pdf_path, api_key, model, upgrade_synthesis=upgrade_synth)
+        save_draft(source, model, result, text, cached_pdf)
+        return True, None
+    except Exception as e:
+        save_draft(source, model, None, "", cached_pdf, error=f"{type(e).__name__}: {e}")
+        return False, f"{type(e).__name__}: {e}"
+
+
+init_db()
+C = counts()
+
+# ── Sidebar ──────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### Configuration")
+    api_key = st.text_input("Gemini API key", type="password",
+                            value=os.environ.get("GEMINI_API_KEY", ""))
+    model = st.selectbox("Model", ["gemini-2.5-flash", "gemini-2.5-pro"],
+                         help="Flash = cheap. Pro = better on interpretive fields.")
+    upgrade_synth = st.checkbox("Upgrade synthesis with Pro",
+                                value=(model == "gemini-2.5-flash"),
+                                help="Re-runs study_objective and key_result on Pro. ~$0.01/study.")
+    unpaywall_email = st.text_input("Email for Unpaywall (DOI lookup)",
+                                    value=os.environ.get("UNPAYWALL_EMAIL", ""),
+                                    help="Required by Unpaywall to fetch open-access PDFs by DOI. "
+                                         "Any real email works.")
+    st.divider()
+    st.markdown("### Progress")
+    cc1, cc2, cc3 = st.columns(3)
+    cc1.metric("Drafts", C.get("draft", 0))
+    cc2.metric("Verified", C.get("verified", 0))
+    cc3.metric("Failed", C.get("failed", 0))
+    st.divider()
+    if st.button("⬇ Export verified to Excel", use_container_width=True):
+        df = load_verified()
+        if len(df):
+            out = Path(__file__).parent / "extracted_studies.xlsx"
+            build_relational_excel(df, out)
+            with open(out, "rb") as f:
+                st.download_button("Download extracted_studies.xlsx", f,
+                                   file_name="extracted_studies.xlsx",
+                                   use_container_width=True)
+        else:
+            st.info("No verified studies yet.")
+    st.divider()
+    st.markdown("##### Danger zone")
+    confirm = st.checkbox("Confirm wipe everything")
+    if st.button("⚠ Reset (delete ALL)", disabled=not confirm, use_container_width=True):
+        reset_all(); st.success("All cleared."); st.rerun()
+
+
+# ── Main: tabs for batch upload / review / saved ─────────────────────────────────
+st.title("AI extraction & verification")
+# ── Tab 2: Review drafts ─────────────────────────────────────────────────────────
+def render_verification(draft_id):
+    """Render the verify-and-save UI for one draft."""
+    data = load_one(draft_id)
+    if not data:
+        st.error("Draft not found."); return
+    src = data["source_file"]
+    result = data["result"]
+
+    st.markdown(f"### Verifying: `{src}` (draft #{draft_id})")
+    left, right = st.columns([3, 2])
+
+    with right:
+        st.markdown("##### Source material")
+        view_tab1, view_tab2 = st.tabs(["📋 Extracted text", "📄 PDF pages"])
+        with view_tab1:
+            st.caption(f"~{len(data['text']):,} chars — exactly what the AI read. Ctrl/Cmd+F to search.")
+            st.text_area("Extracted text", data["text"], height=620,
+                         label_visibility="collapsed", key=f"txt_{draft_id}")
+        with view_tab2:
+            pdf_path = data["pdf_path"]
+            if pdf_path and Path(pdf_path).exists():
+                # Download button — opens natively in Chrome with full search/zoom/highlight
+                with open(pdf_path, "rb") as f:
+                    st.download_button("⬇ Open PDF in browser (full search, zoom, highlight)",
+                                       f.read(), file_name=Path(pdf_path).name,
+                                       mime="application/pdf", key=f"dl_{draft_id}",
+                                       use_container_width=True)
+                st.caption("Click above to open the PDF in a new tab — works in all browsers.")
+                # Render pages as images so they're always visible inline
+                try:
+                    import fitz
+                    doc = fitz.open(pdf_path)
+                    n_pages = len(doc)
+                    show_n = st.slider("Show pages", 1, min(n_pages, 10),
+                                       min(3, n_pages), key=f"pg_{draft_id}",
+                                       help=f"PDF has {n_pages} pages total; showing first N as images.")
+                    for i in range(show_n):
+                        page = doc[i]
+                        # ~120 DPI: enough to read, light enough to be fast
+                        pix = page.get_pixmap(matrix=fitz.Matrix(1.7, 1.7))
+                        img_bytes = pix.tobytes("png")
+                        st.image(img_bytes, caption=f"Page {i+1}/{n_pages}",
+                                 use_container_width=True)
+                    doc.close()
+                except Exception as e:
+                    st.warning(f"Couldn't render PDF pages: {e}. Use the download button above.")
+            else:
+                st.info("PDF not available (cache cleared). Use the Extracted text tab.")
+
+    with left:
+        st.markdown("##### Fields (AI values + source quotes)")
+        edited = {}
+        field_spec = {n: (k, h) for n, k, h in extractor.FIELDS}
+        for field in extractor.SCHEMA_FIELDS:
+            item = result.get(field, {"value": "", "quote": ""})
+            ai_val = item.get("value", "")
+            kind, hint = field_spec.get(field, ("text", ""))
+            if kind == "enum":
+                opts = [""] + hint
+                idx = opts.index(ai_val) if ai_val in opts else 0
+                edited[field] = st.selectbox(field, opts, index=idx, key=f"f_{draft_id}_{field}")
+            elif kind == "yesno":
+                opts = ["", "yes", "no"]
+                idx = opts.index(ai_val) if ai_val in opts else 0
+                edited[field] = st.selectbox(field, opts, index=idx, key=f"f_{draft_id}_{field}")
+            elif kind == "ynp":
+                opts = ["", "yes", "no", "partial"]
+                idx = opts.index(ai_val) if ai_val in opts else 0
+                edited[field] = st.selectbox(field, opts, index=idx, key=f"f_{draft_id}_{field}")
+            else:
+                edited[field] = st.text_input(field, value=ai_val, key=f"f_{draft_id}_{field}")
+            q = item.get("quote", "")
+            if q:
+                st.markdown(f"<div style='font-size:0.78rem;color:#666;margin-top:-8px;"
+                            f"margin-bottom:6px;'>“{q}”</div>", unsafe_allow_html=True)
+        edited["power_pool"] = extractor.compute_pools(edited.get("countries", ""))
+        st.info(f"**Power pool** (computed): {edited['power_pool'] or '—'}")
+
+        bcol1, bcol2 = st.columns(2)
+        if bcol1.button("✅ Save as verified", type="primary", key=f"save_{draft_id}"):
+            quotes = {f: result.get(f, {}).get("quote", "") for f in extractor.SCHEMA_FIELDS}
+            update_verified(draft_id, edited, quotes)
+            st.success("Saved."); st.rerun()
+        if bcol2.button("🗑 Delete this draft", key=f"del_{draft_id}"):
+            delete_extraction(draft_id); st.rerun()
+
+
+
+
+# Navigation that survives reruns (st.tabs always resets to first tab after st.rerun)
+if "main_tab" not in st.session_state:
+    st.session_state.main_tab = "upload"
+tab_labels = {
+    "upload": f"📤 Upload & extract",
+    "review": f"📝 Review drafts ({C.get('draft',0) + C.get('failed',0)})",
+    "saved":  f"✅ Verified ({C.get('verified',0)})",
+}
+choice = st.radio("Section", list(tab_labels.values()), horizontal=True,
+                  index=list(tab_labels.keys()).index(st.session_state.main_tab),
+                  label_visibility="collapsed")
+st.session_state.main_tab = [k for k, v in tab_labels.items() if v == choice][0]
+st.divider()
+
+
+# ── Tab 1: Upload (single or batch) ──────────────────────────────────────────────
+if st.session_state.main_tab == "upload":
+    upload_mode = st.radio("Source", ["📤 Upload PDF files", "🔗 Fetch by DOI (open access only)"],
+                            horizontal=True, label_visibility="collapsed")
+
+    if upload_mode.startswith("📤"):
+        st.caption("Upload one PDF or a batch. Each PDF is extracted and saved as a **draft** "
+                   "you can review in the next tab. Failures are recorded too, so you can retry.")
+        uploaded = st.file_uploader("Choose one or more PDFs", type=["pdf"],
+                                    accept_multiple_files=True)
+        if uploaded and st.button(f"🔍 Extract {len(uploaded)} PDF{'s' if len(uploaded)>1 else ''} with AI",
+                                  type="primary"):
+            if not api_key:
+                st.error("Please provide your Gemini API key in the sidebar.")
+            else:
+                progress = st.progress(0.0)
+                log = st.empty()
+                ok = err = 0
+                for i, up in enumerate(uploaded, 1):
+                    tmp = PDF_CACHE / f"_tmp_{up.name}"
+                    tmp.write_bytes(up.getbuffer())
+                    log.text(f"[{i}/{len(uploaded)}] {up.name}…")
+                    success, errmsg = run_extraction(str(tmp), api_key, model, upgrade_synth)
+                    tmp.unlink(missing_ok=True)
+                    if success: ok += 1
+                    else: err += 1
+                    progress.progress(i / len(uploaded))
+                log.text("")
+                st.success(f"Done. {ok} draft(s) created, {err} failure(s). "
+                           f"Open the 'Review drafts' tab to verify and save.")
+                st.rerun()
+    else:
+        st.caption("Paste DOIs (one per line). Each is looked up on **Unpaywall**; if an open-access "
+                   "PDF exists, it's downloaded and extracted. Articles behind paywalls won't work "
+                   "(expect ~50–65% hit rate on energy journals).")
+        doi_text = st.text_area("DOIs (one per line)",
+                                placeholder="10.1088/1748-9326/11/8/084010\n10.1016/j.energy.2020.117471",
+                                height=120)
+        if doi_text and st.button(f"🔗 Fetch & extract", type="primary"):
+            if not api_key:
+                st.error("Please provide your Gemini API key in the sidebar.")
+            elif not unpaywall_email:
+                st.error("Please provide an email for Unpaywall in the sidebar.")
+            else:
+                dois = [d.strip() for d in doi_text.splitlines() if d.strip()]
+                progress = st.progress(0.0)
+                log = st.empty()
+                ok = paywalled = err = 0
+                for i, doi in enumerate(dois, 1):
+                    log.text(f"[{i}/{len(dois)}] {doi}…")
+                    try:
+                        pdf_path = extractor.fetch_pdf_by_doi(doi, unpaywall_email, str(PDF_CACHE))
+                        success, errmsg = run_extraction(pdf_path, api_key, model, upgrade_synth)
+                        if success: ok += 1
+                        else: err += 1
+                    except FileNotFoundError:
+                        paywalled += 1
+                    except Exception as e:
+                        save_draft(doi, model, None, "", None, error=f"{type(e).__name__}: {e}")
+                        err += 1
+                    progress.progress(i / len(dois))
+                log.text("")
+                msg = f"Done. {ok} draft(s) created."
+                if paywalled: msg += f" {paywalled} DOI(s) paywalled (upload PDF manually)."
+                if err: msg += f" {err} other failure(s)."
+                st.success(msg)
+                st.rerun()
+
+
+elif st.session_state.main_tab == "review":
+    drafts = load_drafts()
+    if not len(drafts):
+        st.info("No drafts to review. Upload PDFs in the first tab.")
+    else:
+        # Quick list of all drafts
+        st.markdown(f"**{len(drafts)} draft(s) waiting.** Pick one to verify.")
+        for _, d in drafts.iterrows():
+            label = f"#{d['id']} — {d['source_file']}"
+            if d["status"] == "failed":
+                label = f"❌ {label} ({d['error'][:80] if d['error'] else 'failed'})"
+            with st.expander(label, expanded=False):
+                if d["status"] == "failed":
+                    st.error(d["error"] or "Unknown error")
+                    if st.button("🗑 Delete this failure", key=f"fail_{d['id']}"):
+                        delete_extraction(int(d["id"])); st.rerun()
+                else:
+                    render_verification(int(d["id"]))
+
+
+# ── Tab 3: Verified studies ──────────────────────────────────────────────────────
+elif st.session_state.main_tab == "saved":
+    df = load_verified()
+    if not len(df):
+        st.info("No verified studies yet.")
+    else:
+        st.caption(f"{len(df)} verified studies. Use the checkboxes to delete some, "
+                   "or export from the sidebar.")
+        show_cols = [c for c in ["_id", "source_file", "model_name", "year", "scale",
+                                 "countries", "power_pool", "extraction_level"] if c in df.columns]
+        disp = df[show_cols].copy()
+        disp.insert(0, "Delete?", False)
+        ed = st.data_editor(disp, use_container_width=True, hide_index=True,
+                            disabled=show_cols, key="verified_editor")
+        to_del = ed.loc[ed["Delete?"] == True, "_id"].tolist()
+        if to_del and st.button(f"🗑 Delete {len(to_del)} selected"):
+            for sid in to_del: delete_extraction(int(sid))
+            st.rerun()
